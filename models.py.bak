@@ -1,0 +1,36 @@
+from sqlalchemy import Column, Integer, String, Boolean
+from sqlalchemy.ext.asyncio import AsyncAttrs, create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import DeclarativeBase
+
+DATABASE_URL = "sqlite+aiosqlite:///./db.sqlite3"
+
+engine = create_async_engine(DATABASE_URL, echo=True)
+async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+class Base(AsyncAttrs, DeclarativeBase):
+    pass
+
+class Questionnaire(Base):
+    __tablename__ = "questionnaires"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, unique=True)
+    name = Column(String)
+    age = Column(Integer)
+    style = Column(String)
+    colors = Column(String)
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    user_id = Column(Integer, primary_key=True)
+    subscription_active = Column(Boolean, default=False)
+    requests_left = Column(Integer, default=0)
+    tariff = Column(String, default="none")
+    search_requests_left = Column(Integer, default=5)
+    outfit_analysis_left = Column(Integer, default=3)
+    advice_messages_left = Column(Integer, default=7)
+
+class PendingPayment(Base):
+    __tablename__ = "pending_payments"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer)
+    payment_id = Column(String)

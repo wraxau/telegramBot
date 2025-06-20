@@ -1,0 +1,778 @@
+from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
+from datetime import datetime, timedelta
+import base64
+import aiohttp
+import json
+from models import async_session, Questionnaire, Subscription, PendingPayment, engine, Base
+from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, StateFilter
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from sqlalchemy import select, update
+from lime_parser import LimeShopParser
+from lichi_parser import LichiShopParser
+from loverepublic_parser import LoveRepublicParser
+from befree_parser import BefreeShopParser
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+from openai import OpenAI
+import time
+import traceback
+from collections import defaultdict
+import logging
+import os
+from yookassa import Configuration, Payment
+from uuid import uuid4
+from aiogram.client.default import DefaultBotProperties
+from aiogram import F
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Загрузка .env
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL_1 = os.getenv("OPENAI_MODEL_1")  # GPT-4o
+OPENAI_MODEL_2 = os.getenv("OPENAI_MODEL_2")  # GPT-4o-mini
+OPENAI_MODEL_3 = os.getenv("OPENAI_MODEL_3")  # DALL-E 3
+
+# Проверка ключей
+if not all([TELEGRAM_TOKEN, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY, OPENAI_API_KEY]):
+    logger.error("Отсутствуют необходимые переменные окружения")
+    exit(1)
+
+# Настройка ЮKassa
+Configuration.account_id = YOOKASSA_SHOP_ID
+Configuration.secret_key = YOOKASSA_SECRET_KEY
+
+# OpenAI клиент
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Ограничение запросов
+photo_last_request = defaultdict(lambda: 0)
+search_last_request = defaultdict(lambda: 0)
+chat_last_request = defaultdict(lambda: 0)
+PHOTO_RATE_LIMIT = 500
+SEARCH_RATE_LIMIT = 500
+CHAT_RATE_LIMIT = 500
+
+def rate_limit_check(user_id: int, request_type: str) -> bool:
+    current_time = time.time()
+    if request_type == "photo":
+        if current_time - photo_last_request[user_id] < PHOTO_RATE_LIMIT:
+            return False
+        photo_last_request[user_id] = current_time
+    elif request_type == "search":
+        if current_time - search_last_request[user_id] < SEARCH_RATE_LIMIT:
+            return False
+        search_last_request[user_id] = current_time
+    elif request_type == "chat":
+        if current_time - chat_last_request[user_id] < CHAT_RATE_LIMIT:
+            return False
+        chat_last_request[user_id] = current_time
+    return True
+
+# Инициализация бота
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+# Парсеры магазинов
+lime_parser = LimeShopParser()
+lichi_parser = LichiShopParser()
+loverepublic_parser = LoveRepublicParser()
+befree_parser = BefreeShopParser()
+executor = ThreadPoolExecutor(max_workers=4)
+
+# Состояния анкеты
+class QuestionnaireStates(StatesGroup):
+    waiting_for_email = State()
+    waiting_for_name = State()
+    waiting_for_age = State()
+    waiting_for_style = State()
+    waiting_for_colors = State()
+
+questions = [
+    "Ваше имя?",
+    "Ваш возраст?",
+    "Какой стиль одежды вы предпочитаете: деловой, спортивный, кэжуал?",
+    "Какие цвета выбираете в одежде?"
+]
+
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Начать диалог"), KeyboardButton(text="Оставить отзыв")],
+            [KeyboardButton(text="Перейти на сайт"), KeyboardButton(text="Ответы на популярные вопросы")],
+            [KeyboardButton(text="Тренды сезона"), KeyboardButton(text="Анализ образа по фото")],
+            [KeyboardButton(text="Поиск одежды"), KeyboardButton(text="Анкета")],
+            [KeyboardButton(text="Оплата")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_questionnaire_actions_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Посмотреть данные"), KeyboardButton(text="Изменить данные")],
+            [KeyboardButton(text="Вернуться в меню")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True
+    )
+
+def get_tariff_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            #[InlineKeyboardButton(text="День (11 RUB)", callback_data="tariff_day")],
+            [InlineKeyboardButton(text="Месяц (299 RUB)", callback_data="tariff_month")],
+            [InlineKeyboardButton(text="3 месяца (749 RUB)", callback_data="tariff_3months")],
+            [InlineKeyboardButton(text="Год (2499 RUB)", callback_data="tariff_year")]
+        ]
+    )
+
+async def check_subscription(user_id: int, session, action: str) -> bool:
+    logger.info(f"[{user_id}] Проверка подписки для действия: {action}")
+    result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+    subscription = result.scalars().first()
+
+    if not subscription:
+        subscription = Subscription(
+            user_id=user_id,
+            subscription_active=False,
+            tariff="none",
+            search_requests_left=5,
+            outfit_analysis_left=3,
+            advice_messages_left=7
+        )
+        session.add(subscription)
+        await session.commit()
+        logger.info(f"[{user_id}] Создана запись без подписки: {subscription.__dict__}")
+
+    if subscription.subscription_active:
+        if subscription.subscription_start and subscription.duration_days:
+            end_date = subscription.subscription_start + timedelta(days=subscription.duration_days)
+            if datetime.now() < end_date:
+                logger.info(f"[{user_id}] Активная подписка: {subscription.tariff}, до {end_date}")
+                return True
+            else:
+                subscription.subscription_active = False
+                subscription.tariff = "none"
+                subscription.search_requests_left = 5
+                subscription.outfit_analysis_left = 3
+                subscription.advice_messages_left = 7
+                await session.commit()
+                logger.info(f"[{user_id}] Подписка истекла, сброшены лимиты")
+
+    if action == "search" and subscription.search_requests_left > 0:
+        return True
+    elif action == "photo" and subscription.outfit_analysis_left > 0:
+        return True
+    elif action == "chat" and subscription.advice_messages_left > 0:
+        return True
+    elif action == "trends":
+        return True
+
+    logger.info(f"[{user_id}] Доступ заблокирован: {action}, лимиты: {subscription.__dict__}")
+    return False
+
+@dp.message(Command(commands=['start', 'menu']))
+async def start_command(message: types.Message):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Команда /start")
+    await message.answer(
+        "👋 Привет! Я — твой персональный стилист. Выбери действие из меню.",
+        reply_markup=get_main_keyboard()
+    )
+
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Вызван обработчик handle_photo, message: {message}")
+
+    if not rate_limit_check(user_id, "photo"):
+        logger.info(f"[{user_id}] Отклонено из-за rate limiting")
+        await message.answer("⏳ Слишком много запросов! Пожалуйста, подождите 15 секунд.",
+                             reply_markup=get_main_keyboard())
+        return
+
+    async with async_session() as session:
+        if not await check_subscription(user_id, session, "photo"):
+            logger.info(f"[{user_id}] Анализ фото заблокирован")
+            await message.answer("🔍 У вас закончились бесплатные анализы (3/3). Купите подписку!",
+                                 reply_markup=get_main_keyboard())
+            return
+
+        logger.info(f"[{user_id}] Анализ фото разрешён")
+        await message.answer("🔍 Анализирую твой образ...", reply=True)
+
+        try:
+            start_time = time.time()
+            photo = message.photo[-2] if len(message.photo) > 1 else message.photo[-1]
+            logger.info(f"[{user_id}] Фото получено, file_id: {photo.file_id}, size: {photo.file_size}")
+
+            file = await bot.get_file(photo.file_id)
+            file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file.file_path}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(file_url) as resp:
+                    if resp.status != 200:
+                        logger.error(f"[{user_id}] Ошибка загрузки файла: {resp.status}")
+                        await message.answer("⚠️ Ошибка загрузки фото.", reply_markup=get_main_keyboard())
+                        return
+                    image_data = await resp.read()
+
+            logger.info(
+                f"[{user_id}] Файл загружен, размер: {len(image_data)}, время: {time.time() - start_time:.2f} сек")
+
+            if len(image_data) > 10 * 1024 * 1024:
+                logger.error(f"[{user_id}] Изображение превышает 10 МБ")
+                await message.answer("⚠️ Фото слишком большое (макс. 10 МБ).", reply_markup=get_main_keyboard())
+                return
+
+            image_format = "jpeg" if image_data.startswith(b'\xFF\xD8') else "png" if image_data.startswith(
+                b'\x89PNG') else None
+            if not image_format:
+                logger.error(f"[{user_id}] Неверный формат изображения")
+                await message.answer("⚠️ Поддерживаются только JPEG и PNG.", reply_markup=get_main_keyboard())
+                return
+
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            logger.info(f"[{user_id}] Base64 длина: {len(image_base64)}")
+
+            response_start = time.time()
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL_2,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Ты профессиональный стилист, который дает дружелюбные и естественные советы по моде. "
+                                    "Проанализируй фото, которое тебе отправил пользователь. Посмотри на одежду в фото и опиши стиль и цвета в коротком, разговорном тексте, как будто ты пишешь другу. "
+                                    "Не используй заголовки, списки или выделение текста (например, жирный шрифт). "
+                                    "Вплети в текст 1-2 совета, как улучшить образ. "
+                                    "Отвечай на русском, в позитивном тоне, не упоминая тип фигуры или личную информацию. "
+                                    "Ответ должен быть 4-5 предложений."
+                                )
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/{image_format};base64,{image_base64}",
+                                    "detail": "low"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=500,
+                temperature=0.7,
+                timeout=30
+            )
+
+            logger.info(f"[{user_id}] Ответ от OpenAI получен, время: {time.time() - response_start:.2f} сек")
+            reply = response.choices[0].message.content.strip()
+            await message.answer(reply, reply_markup=get_main_keyboard())
+
+            result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+            subscription = result.scalars().first()
+            if not subscription.subscription_active:
+                subscription.outfit_analysis_left -= 1
+                await session.commit()
+                logger.info(f"[{user_id}] Остаток анализов фото: {subscription.outfit_analysis_left}")
+
+            logger.info(f"[{user_id}] Обработка завершена, общее время: {time.time() - start_time:.2f} сек")
+
+        except Exception as e:
+            logger.error(f"[{user_id}] Ошибка при анализе фото: {str(e)}")
+            logger.error(traceback.format_exc())
+            await message.answer(f"⚠️ Ошибка при анализе фото: {str(e)}", reply_markup=get_main_keyboard())
+
+@dp.message(lambda message: message.text == "Анкета")
+async def start_questionnaire(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Проверка анкеты")
+    async with async_session() as session:
+        result = await session.execute(select(Questionnaire).where(Questionnaire.user_id == user_id))
+        questionnaire = result.scalars().first()
+        if questionnaire:
+            await message.answer(
+                "У вас уже есть анкета. Что хотите сделать?",
+                reply_markup=get_questionnaire_actions_keyboard()
+            )
+        else:
+            await message.answer(questions[0], reply_markup=get_cancel_keyboard())
+            await state.set_state(QuestionnaireStates.waiting_for_name)
+
+@dp.message(lambda message: message.text == "Посмотреть данные")
+async def view_questionnaire(message: types.Message):
+    user_id = message.from_user.id
+    async with async_session() as session:
+        result = await session.execute(select(Questionnaire).where(Questionnaire.user_id == user_id))
+        questionnaire = result.scalars().first()
+        if questionnaire:
+            response = (
+                f"Ваши данные:\n"
+                f"Имя: {questionnaire.name}\n"
+                f"Возраст: {questionnaire.age}\n"
+                f"Стиль: {questionnaire.style}\n"
+                f"Любимые цвета: {questionnaire.colors}"
+            )
+            await message.answer(response, reply_markup=get_main_keyboard())
+        else:
+            await message.answer("Анкета не найдена.", reply_markup=get_main_keyboard())
+
+@dp.message(lambda message: message.text == "Изменить данные")
+async def edit_questionnaire(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Редактирование анкеты")
+    await message.answer(questions[0], reply_markup=get_cancel_keyboard())
+    await state.set_state(QuestionnaireStates.waiting_for_name)
+
+@dp.message(lambda message: message.text == "Вернуться в меню")
+async def return_to_main_menu(message: types.Message):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Возврат в главное меню")
+    await message.answer("Выберите действие из меню:", reply_markup=get_main_keyboard())
+
+@dp.message(StateFilter(QuestionnaireStates), lambda message: message.text == "Отмена")
+async def cancel_questionnaire(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Отмена анкеты")
+    await message.answer("Анкета отменена.", reply_markup=get_main_keyboard())
+    await state.clear()
+
+@dp.message(QuestionnaireStates.waiting_for_name)
+async def process_name(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Ввод имени: {message.text}")
+    await state.update_data(name=message.text)
+    await message.answer(questions[1], reply_markup=get_cancel_keyboard())
+    await state.set_state(QuestionnaireStates.waiting_for_age)
+
+@dp.message(QuestionnaireStates.waiting_for_age)
+async def process_age(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    try:
+        age = int(message.text)
+        logger.info(f"[{user_id}] Ввод возраста: {age}")
+        await state.update_data(age=age)
+        await message.answer(questions[2], reply_markup=get_cancel_keyboard())
+        await state.set_state(QuestionnaireStates.waiting_for_style)
+    except ValueError:
+        logger.warning(f"[{user_id}] Некорректный возраст: {message.text}")
+        await message.answer("Укажите возраст числом.", reply_markup=get_cancel_keyboard())
+
+@dp.message(QuestionnaireStates.waiting_for_style)
+async def process_style(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Ввод стиля: {message.text}")
+    await state.update_data(style=message.text)
+    await message.answer(questions[3], reply_markup=get_cancel_keyboard())
+    await state.set_state(QuestionnaireStates.waiting_for_colors)
+
+@dp.message(QuestionnaireStates.waiting_for_colors)
+async def process_colors(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    try:
+        user_data = await state.get_data()
+        user_data['colors'] = message.text
+        logger.info(f"[{user_id}] Сохранение анкеты: {user_data}")
+        async with async_session() as session:
+            result = await session.execute(select(Questionnaire).where(Questionnaire.user_id == user_id))
+            questionnaire = result.scalars().first()
+            if questionnaire:
+                await session.execute(
+                    update(Questionnaire)
+                    .where(Questionnaire.user_id == user_id)
+                    .values(
+                        name=user_data['name'],
+                        age=user_data['age'],
+                        style=user_data['style'],
+                        colors=user_data['colors']
+                    )
+                )
+            else:
+                q = Questionnaire(
+                    user_id=user_id,
+                    name=user_data['name'],
+                    age=user_data['age'],
+                    style=user_data['style'],
+                    colors=user_data['colors']
+                )
+                session.add(q)
+            await session.commit()
+        await message.answer("Спасибо! Анкета сохранена.", reply_markup=get_main_keyboard())
+        await state.clear()
+    except Exception as e:
+        logger.error(f"[{user_id}] Ошибка анкеты: {e}")
+        await message.answer("⚠️ Ошибка. Попробуйте снова.", reply_markup=get_main_keyboard())
+        await state.clear()
+
+@dp.message(lambda message: message.text == "Оплата")
+async def handle_payment(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    logger.info(f"[{user_id}] Запрос на оплату")
+    await message.answer("📧 Укажите ваш email для чека:", reply_markup=get_cancel_keyboard())
+    await state.set_state(QuestionnaireStates.waiting_for_email)
+    await state.update_data(user_id=user_id)
+
+@dp.message(QuestionnaireStates.waiting_for_email)
+async def process_email(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    email = message.text.strip()
+    logger.info(f"[{user_id}] Ввод email: {email}")
+    if "@" not in email or "." not in email:
+        await message.answer("⚠️ Укажите корректный email.", reply_markup=get_cancel_keyboard())
+        return
+    await state.update_data(email=email)
+    await message.answer("Выберите тариф:", reply_markup=get_tariff_keyboard())
+
+@dp.callback_query(lambda c: c.data.startswith("tariff_"))
+async def process_tariff_selection(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    tariff = callback_query.data
+    user_data = await state.get_data()
+    email = user_data.get('email')
+    if not email:
+        logger.error(f"[{user_id}] Email отсутствует")
+        await callback_query.message.answer("⚠️ Укажите email для оплаты.", reply_markup=get_main_keyboard())
+        await callback_query.answer()
+        await state.clear()
+        return
+    tariff_info = {
+        "tariff_month": {"name": "Месяц", "value": "299.00", "tariff": "month", "duration_days": 30},
+        "tariff_3months": {"name": "3 месяца", "value": "749.00", "tariff": "3months", "duration_days": 90},
+        "tariff_year": {"name": "Год", "value": "2499.00", "tariff": "year", "duration_days": 365}
+    }[tariff]
+    logger.info(f"[{user_id}] Выбран тариф: {tariff_info['name']}")
+    try:
+        payment = Payment.create(
+            {
+                "amount": {"value": tariff_info['value'], "currency": "RUB"},
+                "confirmation": {"type": "redirect", "return_url": "https://myclosetbot.ru/success"},
+                "capture": True,
+                "description": f"Подписка {tariff_info['name']} для пользователя {user_id}",
+                "metadata": {"user_id": str(user_id), "tariff": tariff_info['tariff']},
+                "receipt": {
+                    "customer": {
+                        "email": email
+                    },
+                    "items": [
+                        {
+                            "description": f"Подписка {tariff_info['name']}",
+                            "quantity": "1",
+                            "amount": {
+                                "value": tariff_info['value'],
+                                "currency": "RUB"
+                            },
+                            "vat_code": 1,
+                            "payment_mode": "full_payment",
+                            "payment_subject": "service"
+                        }
+                    ]
+                }
+            },
+            uuid4()
+        )
+        async with async_session() as session:
+            async with session.begin():
+                session.add(PendingPayment(user_id=user_id, payment_id=payment.id))
+                await session.commit()
+        await callback_query.message.answer(
+            f"💳 Оплатите по ссылке: {payment.confirmation.confirmation_url}\nПосле оплаты отправьте /check_payment",
+            reply_markup=get_main_keyboard()
+        )
+        await state.clear()
+    except Exception as e:
+        logger.error(f"[{user_id}] Ошибка платежа: {str(e)}")
+        await callback_query.message.answer("⚠️ Ошибка. Попробуйте позже.", reply_markup=get_main_keyboard())
+        await state.clear()
+    await callback_query.answer()
+
+@dp.message(Command(commands=['check_payment']))
+async def check_payment(message: types.Message):
+    user_id = message.from_user.id
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(select(PendingPayment).where(PendingPayment.user_id == user_id))
+            pending = result.scalars().first()
+            if not pending:
+                await message.answer("Нет ожидающих платежей.", reply_markup=get_main_keyboard())
+                return
+            try:
+                payment = Payment.find_one(pending.payment_id)
+                if payment.status == "succeeded":
+                    tariff = payment.metadata.get("tariff", "month")
+                    duration_days = {
+                        "month": 30,
+                        "3months": 90,
+                        "year": 365
+                    }[tariff]
+                    result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+                    subscription = result.scalars().first()
+                    if subscription:
+                        subscription.subscription_active = 1
+                        subscription.tariff = tariff
+                        subscription.search_requests_left = 9999
+                        subscription.outfit_analysis_left = 9999
+                        subscription.advice_messages_left = 9999
+                        subscription.subscription_start = datetime.now()
+                        subscription.duration_days = duration_days
+                    else:
+                        session.add(Subscription(
+                            user_id=user_id,
+                            subscription_active=1,
+                            tariff=tariff,
+                            search_requests_left=9999,
+                            outfit_analysis_left=9999,
+                            advice_messages_left=9999,
+                            subscription_start=datetime.now(),
+                            duration_days=duration_days
+                        ))
+                    await session.delete(pending)
+                    await session.commit()
+                    await message.answer(f"💸 Подписка '{tariff}' активирована на {duration_days} дней!", reply_markup=get_main_keyboard())
+                else:
+                    await message.answer(f"Статус платежа: {payment.status}", reply_markup=get_main_keyboard())
+            except Exception as e:
+                logger.error(f"[{user_id}] Ошибка проверки платежа: {str(e)}")
+                await message.answer("⚠️ Ошибка проверки. Попробуйте позже.", reply_markup=get_main_keyboard())
+
+@dp.message(lambda message: message.text == "Поиск одежды")
+async def start_search(message: types.Message):
+    user_id = message.from_user.id
+    async with async_session() as session:
+        if await check_subscription(user_id, session, "search"):
+            logger.info(f"[{user_id}] Поиск разрешён")
+            await message.answer(
+                "🔎 Что ты хочешь найти?\nНапример:\n- платье\n- джинсы\n- футболка",
+                reply_markup=types.ForceReply(selective=True)
+            )
+        else:
+            logger.info(f"[{user_id}] Поиск заблокирован")
+            await message.answer(
+                "🔍 У вас закончились бесплатные поиски (5/5). Купите подписку!",
+                reply_markup=get_main_keyboard()
+            )
+
+@dp.message(lambda message: message.reply_to_message and "что ты хочешь найти" in message.reply_to_message.text.lower())
+async def handle_search_reply(message: types.Message):
+    user_id = message.from_user.id
+    async with async_session() as session:
+        if not await check_subscription(user_id, session, "search"):
+            logger.info(f"[{user_id}] Поиск заблокирован в handle_search_reply")
+            await message.answer(
+                "🔍 У вас закончились бесплатные поиски (5/5). Купите подписку!",
+                reply_markup=get_main_keyboard()
+            )
+            return
+        await handle_fashion_search(message)
+        result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+        subscription = result.scalars().first()
+        if not subscription.subscription_active:
+            subscription.search_requests_left -= 1
+            await session.commit()
+            logger.info(f"[{user_id}] Остаток поисков: {subscription.search_requests_left}")
+
+async def handle_fashion_search(message: types.Message):
+    user_id = message.from_user.id
+    if not rate_limit_check(user_id, "search"):
+        await message.answer("⏳ Подождите 5 секунд.", reply_markup=get_main_keyboard())
+        return
+    try:
+        search_query = message.text.strip()
+        logger.info(f"[{user_id}] Поиск: {search_query}")
+        status_message = await message.answer(f"🔍 Ищу '{search_query}'...")
+        lime_task = asyncio.create_task(run_parser(lime_parser, search_query, "LIME"))
+        lichi_task = asyncio.create_task(run_parser(lichi_parser, search_query, "LICHI"))
+        loverepublic_task = asyncio.create_task(run_parser(loverepublic_parser, search_query, "LOVE REPUBLIC"))
+        lime_urls, lichi_urls, loverepublic_urls = await asyncio.gather(
+            lime_task, lichi_task, loverepublic_task
+        )
+        response_text = f"🛍 Результаты поиска '{search_query}':\n\n"
+        if lime_urls:
+            response_text += "🏪 LIME:\n" + "\n".join(f"{i}. {url}" for i, url in enumerate(lime_urls[:5], 1)) + "\n\n"
+        if lichi_urls:
+            response_text += "🏪 LICHI:\n" + "\n".join(f"{i}. {url.url}" for i, url in enumerate(lichi_urls[:5], 1)) + "\n\n"
+        if loverepublic_urls:
+            response_text += "🏪 LOVE REPUBLIC:\n" + "\n".join(f"{i}. {url.url}" for i, url in enumerate(loverepublic_urls[:5], 1)) + "\n\n"
+        if any([lime_urls, lichi_urls, loverepublic_urls]):
+            await status_message.edit_text(response_text)
+            try:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"search_results/search_{user_id}_{timestamp}.json"
+                os.makedirs("search_results", exist_ok=True)
+                results = {
+                    "user_id": user_id,
+                    "query": search_query,
+                    "timestamp": datetime.now().isoformat(),
+                    "lime_urls": lime_urls,
+                    "lichi_urls": [item.url for item in lichi_urls] if lichi_urls else [],
+                    "loverepublic_urls": [item.url for item in loverepublic_urls] if loverepublic_urls else []
+                }
+                with open(filename, "w", encoding="utf-8") as f:
+                    json.dump(results, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"[{user_id}] Ошибка сохранения результатов: {e}")
+        else:
+            await status_message.edit_text(f"😔 По запросу '{search_query}' ничего не найдено.")
+    except Exception as e:
+        logger.error(f"[{user_id}] Ошибка поиска: {e}")
+        await message.answer("⚠️ Ошибка при поиске.", reply_markup=get_main_keyboard())
+
+@dp.message(lambda message: message.text in ["Тренды сезона", "тренды", "модные тренды", "что в моде"])
+async def handle_trends(message: types.Message):
+    user_id = message.from_user.id
+    if not rate_limit_check(user_id, "chat"):
+        await message.answer("⏳ Подождите 5 секунд.", reply_markup=get_main_keyboard())
+        return
+    try:
+        await message.answer("🚨 Подбираю тренды весна 2025...", reply_markup=get_main_keyboard())
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL_1,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a fashion consultant. Write a short message about current fashion trends in Russian. "
+                    "Maximum 2-3 sentences, direct and understandable."
+                )},
+                {"role": "user", "content": "Spring 2025 fashion trends"}
+            ]
+        )
+        trends_text = response.choices[0].message.content
+        await message.answer(f"Тренды: {trends_text}", reply_markup=get_main_keyboard())
+        await message.answer("📸 Генерирую образ в трендах весны 2025...", reply_markup=get_main_keyboard())
+        image_response = client.images.generate(
+            model="dall-e-3",
+            prompt=(
+                f"Реалистичная фотография молодой женщины, одетой в трендовую одежду: {trends_text}. "
+                "На нейтральном фоне, высокое качество, естественное освещение, акцент на модной одежде."
+            ),
+            n=1,
+            size="1024x1024",
+            quality="standard"
+        )
+        image_url = image_response.data[0].url
+        logger.info(f"[{user_id}] Успешная генерация изображения: {image_url}")
+        await message.answer_photo(image_url, caption="Вот пример трендового образа!", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.debug(f"[{user_id}] Ошибка трендов: {str(e)}")
+        await message.answer("⚠️ Ошибка при обработке трендов. Попробуйте позже.", reply_markup=get_main_keyboard())
+
+@dp.message(lambda message: message.text in ["Перейти на сайт", "Ответы на популярные вопросы", "Начать диалог", "Оставить отзыв"])
+async def handle_text_buttons(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text.lower()
+    logger.info(f"[{user_id}] Нажата кнопка: {text}")
+    if text == "перейти на сайт":
+        await message.answer(
+            "[Открыть сайт](https://myclosetai.tilda.ws/myclosetai)",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+    elif text == "ответы на популярные вопросы":
+        await message.answer(
+            "Привет! Это ответы на самые популярные вопросы. Если ты не нашел ответ на свой - напиши в поддержку, тебе обязательно помогут.\n\n"
+            "1. Среди каких магазинов бот ищет одежду?\n"
+            "- Наш бот умеет искать одежду из онлайн-магазинов Lichi, Lime, Love Republic. Чуть позже планируем добавить еще больше магазинов.\n\n"
+            "2. Что входит в подписку?\n"
+            "- Приобретая подписку ты получаешь: неограниченное количество запросов на поиск одежды, анализа образа и стильных советов.\n\n"
+            "3. Как стать нашим партнером?\n"
+            "- Мы в поиске партнеров! Если у тебя есть блог о моде или локальный бренд, пиши нашему CEO @soffree для обсуждения сотрудничества.",
+            reply_markup=get_main_keyboard()
+        )
+    elif text == "начать диалог":
+        await message.answer("💬 Напиши вопрос о моде!", reply_markup=get_main_keyboard())
+    elif text == "оставить отзыв":
+        await message.answer(
+            "📝 Оставьте отзыв: https://docs.google.com/forms/d/e/1FAIpQLSco6q3-PPSwZ7-Rqw02lVaNT4gAaIaJGLUlvNUCYlACUrklyYw/viewform",
+            reply_markup=get_main_keyboard()
+        )
+
+@dp.message()
+async def chat_with_stylist(message: types.Message):
+    user_id = message.from_user.id
+    if message.photo:
+        logger.info(f"[{user_id}] Фото отправлено, но игнорируется в chat_with_stylist")
+        await message.answer("📸 Пожалуйста, отправьте фото снова для анализа.", reply_markup=get_main_keyboard())
+        return
+    async with async_session() as session:
+        if not await check_subscription(user_id, session, "chat"):
+            logger.info(f"[{user_id}] Диалог заблокирован")
+            await message.answer(
+                "💬 У вас закончились бесплатные вопросы (7/7). Купите подписку!",
+                reply_markup=get_main_keyboard()
+            )
+            return
+        logger.info(f"[{user_id}] Диалог разрешён")
+        if not rate_limit_check(user_id, "chat"):
+            await message.answer("⏳ Подождите 5 секунд.", reply_markup=get_main_keyboard())
+            return
+        try:
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL_1,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a fashion stylist. Answer in Russian, naturally and conversationally. "
+                        "Focus on fashion advice, avoid personal questions."
+                    )},
+                    {"role": "user", "content": message.text}
+                ],
+                timeout=30
+            )
+            reply = response.choices[0].message.content
+            if any(word in message.text.lower() for word in ["анализ", "фото", "образ"]):
+                reply = "📸 Для анализа изображения отправьте фото, а не текст."
+            await message.answer(reply, reply_markup=get_main_keyboard())
+            result = await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+            subscription = result.scalars().first()
+            if not subscription.subscription_active:
+                subscription.advice_messages_left -= 1
+                await session.commit()
+                logger.info(f"[{user_id}] Остаток вопросов: {subscription.advice_messages_left}")
+        except Exception as e:
+            logger.error(f"[{user_id}] Ошибка: {str(e)}")
+            await message.answer("⚠️ Ошибка.", reply_markup=get_main_keyboard())
+
+async def run_parser(parser, query, store_name):
+    try:
+        loop = asyncio.get_event_loop()
+        urls = await loop.run_in_executor(executor, parser.get_product_urls, query)
+        logger.info(f"[{store_name}] Вернул {len(urls)} urls")
+        return urls
+    except Exception as e:
+        logger.error(f"[{store_name}] Ошибка: {e}")
+        return []
+
+async def main():
+    logger.info("Запуск бота...")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await dp.start_polling(bot)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен")
+    except Exception as e:
+        logger.error(f"Ошибка запуска: {str(e)}")
+    finally:
+        executor.shutdown(wait=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,181 @@
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from dataclasses import dataclass
+from typing import List
+import logging
+import time
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class BefreeItem:
+    url: str
+
+class BefreeShopParser:
+    BASE_URL = "https://befree.ru/zhenskaya"
+    def __init__(self):
+        self.chrome_options = Options()
+        self.chrome_options.add_argument('--no-sandbox')
+        self.chrome_options.add_argument('--disable-dev-shm-usage')
+        self.chrome_options.add_argument('--ignore-certificate-errors')
+        self.chrome_options.add_argument('--ignore-ssl-errors')
+        self.chrome_options.add_argument('--window-size=1920,1080')
+        self.chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
+        self.chrome_options.add_experimental_option('useAutomationExtension', False)
+        self.chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+        self.chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+    def init_driver(self):
+        """Инициализация драйвера Chrome"""
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=self.chrome_options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        return driver
+
+    def scroll_to_bottom(self, driver):
+        """Прокрутка страницы до конца для загрузки всех товаров"""
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        scrolls = 0
+        max_scrolls = 10  # Максимальное количество прокруток
+        
+
+        while scrolls < max_scrolls:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
+            scrolls += 1
+            logger.info(f"Прокрутка {scrolls}/{max_scrolls}, высота: {new_height}")
+
+    def get_product_urls(self, query: str) -> List[BefreeItem]:
+        """Получает список URL товаров по поисковому запросу"""
+        driver = None
+        items = []
+        try:
+            logger.info(f"[BEFREE] Начало поиска для запроса: {query}")
+            driver = self.init_driver()
+            driver.get(self.BASE_URL)
+            
+            logger.info("[BEFREE] Ожидание загрузки страницы...")
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script('return document.readyState') == 'complete'
+            )
+            
+            time.sleep(2)
+            
+            # Поиск и клик по кнопке поиска
+            logger.info("[BEFREE] Поиск кнопки поиска...")
+            button = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "button.digi-search-submit"))
+            )
+            
+            driver.execute_script("arguments[0].scrollIntoView(true);", button)
+            time.sleep(1)
+
+            # Ввод поискового запроса
+            logger.info(f"[BEFREE] Ввод поискового запроса: {query}")
+            driver.execute_script("""
+                const input = document.querySelector('input.digi-search-form__input');
+                if (input) {
+                    input.value = arguments[0];
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            """, query)
+            
+            # Клик по кнопке поиска
+            submit_button = driver.execute_script("""
+                return document.querySelector('button.digi-search-form__submit');
+            """)
+            
+            if submit_button:
+                logger.info("[BEFREE] Клик по кнопке поиска...")
+                driver.execute_script("arguments[0].click();", submit_button)
+                time.sleep(3)
+                
+                # Прокрутка для загрузки всех товаров
+                self.scroll_to_bottom(driver)
+                
+                # Сбор ссылок на товары
+                logger.info("[BEFREE] Сбор ссылок на товары...")
+                links = driver.execute_script("""
+                    const links = [];
+                    const selectors = [
+                        'article.product-card a',
+                        '.product-card a',
+                        'a[href*="/product/"]',
+                        'a[href*="/catalog/"]'
+                    ];
+                    
+                    for (const selector of selectors) {
+                        document.querySelectorAll(selector).forEach(link => {
+                            if (link.href && link.href.includes('/product/')) {
+                                links.push({url: link.href});
+                            }
+                        });
+                    }
+                    return links;
+                """)
+                
+                # Добавление найденных ссылок в результаты
+                if links:
+                    seen_urls = set()
+                    for link in links:
+                        url = link['url']
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            items.append(BefreeItem(url=url))
+                    logger.info(f"[BEFREE] Найдено товаров: {len(items)}")
+                else:
+                    logger.info("[BEFREE] Товары не найдены")
+            
+            else:
+                logger.error("[BEFREE] Кнопка поиска не найдена")
+
+            return items
+
+        except Exception as e:
+            logger.error(f"[BEFREE] Ошибка: {e}")
+            return []
+        finally:
+            if driver:
+                driver.quit()
+                logger.info("[BEFREE] Драйвер закрыт")
+
+def test_parser():
+    """Функция для тестирования парсера"""
+    parser = BefreeShopParser()
+    query = "футболка"
+    print(f"\nПоиск товаров: {query}")
+    print("=" * 50)
+    
+    results = parser.get_product_urls(query)
+    
+    if results:
+        print(f"\nНайдено товаров: {len(results)}")
+        print("\nСписок найденных товаров:")
+        print("-" * 100)
+        
+        for i, item in enumerate(results, 1):
+            print(f"{i}. {item.url}")
+        
+        print(f"\nВсего найдено товаров: {len(results)}")
+    else:
+        print("Товары не найдены")
+    
+    print("=" * 100)
+
+if __name__ == "__main__":
+    test_parser()
